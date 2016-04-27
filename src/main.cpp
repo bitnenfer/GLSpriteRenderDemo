@@ -5,17 +5,26 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <random>
+#include <immintrin.h>
+#include <new>
 
 // Comment this to render with naive approach.
 #define USE_DYNAMIC_STREAMING
 
+// Comment this to use scalar loops
+#define USE_SIMD
+
 #if _WIN32
 #define FORCEINLINE __forceinline
+#define ALIGNAS(X) __declspec(align(X))
 #else
-#define FORCEINLINE inline
+#define FORCEINLINE __attribute__((always_inline))
+#define ALIGNAS(X) __attribute__((aligned(X)))
 #endif
 
-#define SPRITE_COUNT 1036800
+#define SPRITE_COUNT 1000000
+#define SPRITE_256VECTOR_COUNT SPRITE_COUNT / 8
 
 #pragma region Shader Source
 const char* FAST_SPRITE_VSHADER =
@@ -71,8 +80,8 @@ GLuint compileShader(GLuint program, const char* source, GLenum type)
 #pragma region Global Data
 static SDL_Window* pSDLWindow;
 static SDL_GLContext sdlOpenGLContext;
-static const size_t appWidth = 1920;
-static const size_t appHeight = 1080;
+static const size_t appWidth = /*1920;//*/ 1080;
+static const size_t appHeight = /*1080; //*/ 720;
 static const size_t appHalfWidth = appWidth / 2;
 static const size_t appHalfHeight = appHeight / 2;
 static const size_t vertPerQuad = 6;
@@ -96,6 +105,13 @@ static GLuint locVertexCol;
 static GLbitfield allocFlag;
 static size_t vpSize;
 static size_t vcSize;
+static float gravity = 1.5f;
+static __m256 vGravity = _mm256_set1_ps(gravity);
+static __m256 vYLimits = _mm256_set1_ps((float)appHeight);
+static __m256 vXLimitLeft = _mm256_set1_ps(0);
+static __m256 vXLimitRight = _mm256_set1_ps((float)appWidth);
+static __m256 vBounceMask = _mm256_set1_ps(-1.0005f);
+static __m256 vOne = _mm256_set1_ps(1);
 #pragma endregion
 #pragma region Drawing API
 FORCEINLINE void flushBufferData0()
@@ -104,7 +120,7 @@ FORCEINLINE void flushBufferData0()
 	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * bufferDataIndex * vertPerQuad * 2, pVertexPosBufferData);
 	glBindBuffer(GL_ARRAY_BUFFER, vertexColVBO);
 	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * bufferDataIndex * vertPerQuad * 4, pVertexColBufferData);
-	glDrawArrays(GL_TRIANGLES, 0, bufferDataIndex * vertPerQuad);
+	glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(bufferDataIndex * vertPerQuad));
 	bufferDataIndex = 0;
 	pVertexPosCurrent = pVertexPosBufferData;
 	pVertexColCurrent = pVertexColBufferData;
@@ -112,7 +128,7 @@ FORCEINLINE void flushBufferData0()
 
 FORCEINLINE void flushBufferData1()
 {
-	glDrawArrays(GL_TRIANGLES, 0, bufferDataIndex * vertPerQuad);
+	glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(bufferDataIndex * vertPerQuad));
 	bufferDataIndex = 0;
 	pVertexPosCurrent = pVertexPosBufferData;
 	pVertexColCurrent = pVertexColBufferData;
@@ -137,6 +153,16 @@ FORCEINLINE void setColor(float r, float g, float b, float a = 1.0f)
 
 FORCEINLINE void drawRect(float x, float y, float width, float height)
 {
+	#if defined(USE_SIMD)
+	__m128* vPos = (__m128*)pVertexPosCurrent;
+	vPos[0] = _mm_setr_ps(x, y, x + width, y + height);
+	vPos[1] = _mm_setr_ps(x, y + height, x, y);
+	vPos[2] = _mm_setr_ps(x + width, y, x + width, y + height);
+	__m256* vColor = (__m256*)pVertexColCurrent;
+	vColor[0] = _mm256_setr_ps(colorR, colorG, colorB, 1, colorR, colorG, colorB, 1);
+	vColor[1] = _mm256_setr_ps(colorR, colorG, colorB, 1, colorR, colorG, colorB, 1);
+	vColor[2] = _mm256_setr_ps(colorR, colorG, colorB, 1, colorR, colorG, colorB, 1);
+	#else
 	// first triangle
 	pVertexPosCurrent[0] = x;
 	pVertexPosCurrent[1] = y;
@@ -178,7 +204,8 @@ FORCEINLINE void drawRect(float x, float y, float width, float height)
 	pVertexColCurrent[20] = colorR;
 	pVertexColCurrent[21] = colorG;
 	pVertexColCurrent[22] = colorB;
-	pVertexColCurrent[23] = colorA;	
+	pVertexColCurrent[23] = colorA;
+	#endif
 
 	pVertexPosCurrent = (float*)((char*)pVertexPosCurrent + (sizeof(float) * 12));
 	pVertexColCurrent = (float*)((char*)pVertexColCurrent + (sizeof(float) * 24));
@@ -215,6 +242,107 @@ FORCEINLINE void initOpenGLContext()
 #define main SDL_main
 #endif
 #pragma endregion
+#pragma region Particle
+struct Particles
+{
+	union ALIGNAS(32)
+	{
+		float positionX[SPRITE_COUNT];
+		__m256 vPositionX[SPRITE_256VECTOR_COUNT];
+	};
+	union ALIGNAS(32)
+	{
+		float positionY[SPRITE_COUNT];
+		__m256 vPositionY[SPRITE_256VECTOR_COUNT];
+	};
+	union ALIGNAS(32)
+	{
+		float velocityX[SPRITE_COUNT];
+		__m256 vVelocityX[SPRITE_256VECTOR_COUNT];
+	};
+	union ALIGNAS(32)
+	{
+		float velocityY[SPRITE_COUNT];
+		__m256 vVelocityY[SPRITE_256VECTOR_COUNT];
+	};
+
+	float colorR[SPRITE_COUNT];
+	float colorG[SPRITE_COUNT];
+	float colorB[SPRITE_COUNT];
+	size_t count;
+};
+
+FORCEINLINE void constructParticles(Particles* pParticles)
+{
+	std::default_random_engine generator;
+	std::uniform_real_distribution<float> velX(5, 10);
+	std::uniform_real_distribution<float> velY(-5, 10);
+	std::uniform_real_distribution<float> col(0, 1);
+	
+	for (size_t index = 0; index < SPRITE_COUNT; ++index)
+	{
+		pParticles->positionX[index] = 0;
+		pParticles->positionY[index] = 100;
+		pParticles->velocityX[index] = velX(generator) * sin((float)index);
+		pParticles->velocityY[index] = velY(generator) * sin((float)index);
+		pParticles->colorR[index] = col(generator);
+		pParticles->colorG[index] = col(generator);
+		pParticles->colorB[index] = col(generator);
+	}
+	pParticles->count = 0;//SPRITE_COUNT;
+}
+FORCEINLINE void updateParticles(Particles* pParticles)
+{
+	#if defined(USE_SIMD)
+	for (size_t index = 0; index < pParticles->count / 8; ++index)
+	{
+		pParticles->vVelocityY[index] = _mm256_add_ps(pParticles->vVelocityY[index], vGravity);
+		pParticles->vPositionY[index] = _mm256_add_ps(pParticles->vPositionY[index], pParticles->vVelocityY[index]);
+		pParticles->vPositionX[index] = _mm256_add_ps(pParticles->vPositionX[index], pParticles->vVelocityX[index]);
+		 __m256 vBounceY = _mm256_mul_ps(_mm256_blendv_ps(vBounceMask, vOne, _mm256_cmp_ps(pParticles->vPositionY[index], vYLimits, _CMP_GT_OQ)), vBounceMask);
+		 __m256 vBounceXL = _mm256_mul_ps(_mm256_blendv_ps(vBounceMask, vOne, _mm256_cmp_ps(pParticles->vPositionX[index], vXLimitRight, _CMP_GT_OQ)), vBounceMask);
+		 __m256 vBounceXR = _mm256_mul_ps(_mm256_blendv_ps(vBounceMask, vOne, _mm256_cmp_ps(pParticles->vPositionX[index], vXLimitLeft, _CMP_LT_OQ)), vBounceMask);
+		pParticles->vVelocityY[index] = _mm256_mul_ps(pParticles->vVelocityY[index], vBounceY);
+		pParticles->vVelocityX[index] = _mm256_mul_ps(pParticles->vVelocityX[index], vBounceXL);
+		pParticles->vVelocityX[index] = _mm256_mul_ps(pParticles->vVelocityX[index], vBounceXR);
+		pParticles->vPositionY[index] = _mm256_min_ps(pParticles->vPositionY[index], vYLimits);
+		pParticles->vPositionX[index] = _mm256_min_ps(pParticles->vPositionX[index], vXLimitRight);
+		pParticles->vPositionX[index] = _mm256_max_ps(pParticles->vPositionX[index], vXLimitLeft);
+	}
+	#else
+	for (size_t index = 0; index < pParticles->count; ++index)
+	{
+		pParticles->velocityY[index] += gravity;
+		pParticles->positionY[index] += pParticles->velocityY[index];
+		pParticles->positionX[index] += pParticles->velocityX[index];
+
+		if (pParticles->positionY[index] > appHeight - 100)
+		{
+			pParticles->positionY[index] = appHeight - 100;
+			pParticles->velocityY[index] *= -1.01f;
+		}
+		if (pParticles->positionX[index] > appWidth - 100)
+		{
+			pParticles->positionX[index] = appWidth - 100;
+			pParticles->velocityX[index] *= -1.0f;
+		}
+		else if (pParticles->positionX[index] < 100)
+		{
+			pParticles->positionX[index] = 100;
+			pParticles->velocityX[index] *= -1.0f;
+		}
+	}
+	#endif
+}
+FORCEINLINE void renderParticles(Particles* pParticles)
+{
+	for (size_t index = 0; index < pParticles->count; ++index)
+	{
+		setColor(pParticles->colorR[index], pParticles->colorG[index], pParticles->colorB[index]);
+		drawRect(pParticles->positionX[index], pParticles->positionY[index], 2, 2);
+	}
+}
+#pragma endregion
 
 int main(int argc, char *args[])
 {
@@ -225,12 +353,15 @@ int main(int argc, char *args[])
 	#pragma endregion
 
 	unsigned int factor = 0;
+	Particles* pParticles = new(_aligned_malloc(sizeof(Particles), 32)) Particles;
 	float ortho2D[16] = {
 		2.0f / appWidth, 0, 0, 0,
 		0, -2.0f / appHeight, 0, 0,
 		0, 0, 1.0f, 1.0f,
 		-1.0f, 1.0f, 0, 0
 	};
+
+	constructParticles(pParticles);
 
 	// Setup Shader
 	shaderProgram = glCreateProgram();
@@ -257,7 +388,7 @@ int main(int argc, char *args[])
 		GL_MAP_WRITE_BIT |
 		GL_MAP_PERSISTENT_BIT |
 		GL_MAP_COHERENT_BIT;
-	GLbitfield createFlags = mapFlags | GL_DYNAMIC_STORAGE_BIT;	
+	GLbitfield createFlags = mapFlags | GL_DYNAMIC_STORAGE_BIT;
 
 	glBindBuffer(GL_ARRAY_BUFFER, vertexPosVBO);
 	glBufferStorage(GL_ARRAY_BUFFER, vpSize, nullptr, createFlags);
@@ -294,6 +425,10 @@ int main(int argc, char *args[])
 	glClearColor(0, 0, 0, 1);
 	while (run)
 	{
+		glClear(GL_COLOR_BUFFER_BIT);
+		updateParticles(pParticles);
+		renderParticles(pParticles);
+		flush();
 		#pragma region SDL Event Polling
 		while (SDL_PollEvent(&event))
 		{
@@ -301,16 +436,10 @@ int main(int argc, char *args[])
 				run = false;
 			else if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)
 				run = false;
+			else if (event.type == SDL_KEYDOWN && pParticles->count < SPRITE_COUNT)
+				pParticles->count += 10000;
 		}
 		#pragma endregion
-		glClear(GL_COLOR_BUFFER_BIT);
-		factor++;
-		for (size_t index = 0; index < SPRITE_COUNT; ++index)
-		{
-			setColor(((index + factor) % 255) / 255.0f, ((index + factor) % 250) / 255.0f, ((index + factor) % 200) / 255.0f);
-			drawRect(index % appHalfWidth * 2, index / appHalfWidth * 2, 2, 2);
-		}
-		flush();
 		#pragma region Swap Buffers
 		SDL_GL_SwapWindow(pSDLWindow);
 		#pragma endregion
@@ -325,5 +454,6 @@ int main(int argc, char *args[])
 	glDeleteShader(vertexShader);
 	glDeleteShader(fragmentShader);
 	glDeleteProgram(shaderProgram);
+	_aligned_free(pParticles);
 	return 0;
 }
